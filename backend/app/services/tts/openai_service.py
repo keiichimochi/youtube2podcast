@@ -64,35 +64,85 @@ class OpenAITTSService(BaseTTSService):
         # 各チャンクを非同期でTTS処理し、結果を結合
         audio_segments = []
         tasks = []
-        for chunk in chunks:
+        print(f"Processing {len(chunks)} chunks for TTS...") # Debug log
+        for i, chunk in enumerate(chunks):
             if chunk: # 空のチャンクはスキップ
-                 tasks.append(self._generate_speech_chunk(chunk))
+                 # print(f"Adding task for chunk {i+1}/{len(chunks)}: {chunk[:50]}...") # Verbose debug log
+                 tasks.append(self._generate_speech_chunk(chunk, i+1))
         
-        audio_segments_results = await asyncio.gather(*tasks)
+        # asyncio.gather で並列実行、エラーが発生しても他のタスクは続行 (return_exceptions=True)
+        audio_segments_results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # 結果を結合 (bytesを単純に結合)
-        # より高度な結合 (無音部分の調整など) は pydub などが必要になるが、まずは単純結合
-        full_audio = b"".join(filter(None, audio_segments_results))
+        # 結果を結合 (成功したbytesのみ)
+        full_audio_io = io.BytesIO()
+        successful_chunks = 0
+        for i, result in enumerate(audio_segments_results):
+            if isinstance(result, bytes):
+                full_audio_io.write(result)
+                successful_chunks += 1
+            elif isinstance(result, Exception):
+                # gatherでキャッチした例外をログに出力
+                print(f"Error processing chunk {i+1}: {result}")
+            # else: # None の場合 (generate_speech_chunk内でエラー処理済み)
+                 # print(f"Chunk {i+1} resulted in None.")
+                 
+        print(f"Successfully processed {successful_chunks}/{len(chunks)} chunks.") # Debug log
+        
+        full_audio = full_audio_io.getvalue()
         
         if not full_audio:
-             raise ValueError("TTS generation resulted in empty audio.")
+             # エラーの原因をもう少し詳しく示す
+             error_details = "No audio data could be generated. Possible reasons: All text chunks failed TTS conversion, or the input text was empty after processing."
+             # audio_segments_results に含まれるエラー情報を集約することも検討
+             failed_count = len(chunks) - successful_chunks
+             if failed_count > 0:
+                  error_details += f" ({failed_count} chunk(s) failed). Check logs for details."
+             raise ValueError(error_details)
              
         return full_audio
 
-    async def _generate_speech_chunk(self, chunk: str) -> bytes | None:
+    async def _generate_speech_chunk(self, chunk: str, chunk_num: int) -> bytes | None:
         """Generate speech for a single chunk."""
+        if not self.client:
+             print(f"[Chunk {chunk_num}] Error: OpenAI client not initialized.")
+             return None
         try:
+            print(f"[Chunk {chunk_num}] Requesting TTS for chunk: {chunk[:50]}...") # Debug log
             response = await self.client.audio.speech.create(
                 model="tts-1",
-                voice="nova", # 好みのvoiceに変更可能
+                voice="nova",
                 input=chunk,
-                response_format="mp3" # 形式を指定
+                response_format="mp3"
             )
-            # responseからbytesを取得 (非同期で読み取る)
-            audio_bytes = await response.read()
+            
+            print(f"[Chunk {chunk_num}] Response type: {type(response)}")
+            
+            audio_bytes = None
+            try:
+                 print(f"[Chunk {chunk_num}] Attempting to await response.read()...")
+                 audio_bytes = await response.read()
+                 print(f"[Chunk {chunk_num}] Successfully read {len(audio_bytes)} bytes via await.")
+            except TypeError as te:
+                 print(f"[Chunk {chunk_num}] TypeError during await response.read(): {te}. Checking response.content...")
+                 # TypeErrorの場合、response.content が bytes か確認
+                 if hasattr(response, 'content') and isinstance(response.content, bytes):
+                     audio_bytes = response.content
+                     print(f"[Chunk {chunk_num}] Successfully got {len(audio_bytes)} bytes via response.content.")
+                 else:
+                     # response.content が bytes でない場合、エラー
+                     content_type = type(response.content) if hasattr(response, 'content') else 'N/A'
+                     print(f"[Chunk {chunk_num}] Failed to get bytes via response.content (type: {content_type}).")
+                     raise ValueError(f"Cannot extract audio bytes after TypeError.") from te
+            except Exception as read_err:
+                 print(f"[Chunk {chunk_num}] Error reading audio data from response: {read_err}")
+                 raise
+            
+            if not audio_bytes:
+                 print(f"[Chunk {chunk_num}] Warning: TTS generation returned empty bytes for the chunk.")
+                 return None
+                 
             return audio_bytes
+            
         except Exception as e:
-             # 個々のチャンクでのエラーをログに残す
-             print(f"Error generating speech for chunk: {e}, chunk: {chunk[:50]}...")
-             # エラーが発生したチャンクはスキップして None を返す (あるいは例外を再raiseする)
-             return None 
+             print(f"[Chunk {chunk_num}] Error generating speech for chunk via API: {e}")
+             raise e 
