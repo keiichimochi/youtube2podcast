@@ -5,11 +5,13 @@ import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardFooter } from '@/components/ui/card';
 import { AudioPlayer } from '@/components/AudioPlayer';
-import { Loader2, AlertCircle, Download, Coins, BrainCircuit } from 'lucide-react';
+import { Loader2, AlertCircle, Download, Coins, BrainCircuit, Youtube, Upload, Link as LinkIcon, Text, FileText } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Separator } from "@/components/ui/separator";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import { Label } from "@/components/ui/label"
+import { Textarea } from "@/components/ui/textarea";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 const MAX_HISTORY_LENGTH = 10;
 const HISTORY_STORAGE_KEY = 'youtube2podcast_url_history';
@@ -47,6 +49,15 @@ function formatCost(cost: number | undefined): string {
   return cost < 0.0001 && cost > 0 ? `$${cost.toExponential(2)}` : `$${cost.toFixed(4)}`;
 }
 
+// --- Define Aivis Speakers --- 
+const aivisSpeakers = [
+  { id: '488039072', name: 'korosuke' },
+  { id: '888753760', name: 'Anneli (ノーマル)' },
+  { id: '1763602272', name: 'kiyoshi' },
+  { id: '269244800', name: 'sakuragi' },
+  { id: '1342155808', name: 'yamaoka' },
+];
+
 export default function Home() {
   const [url, setUrl] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
@@ -56,10 +67,17 @@ export default function Home() {
   const [progressMessages, setProgressMessages] = useState<ProgressMessage[]>([]);
   const eventSourceRef = useRef<EventSource | null>(null);
   const [ttsService, setTtsService] = useState<string>('openai');
-  const [aivisSpeakerId, setAivisSpeakerId] = useState<string>('488039072');
+  const [aivisSpeakerId, setAivisSpeakerId] = useState<string>(aivisSpeakers[0].id);
   const [openaiVoice, setOpenaiVoice] = useState<string>('alloy');
   const openaiVoices = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'];
   const [geminiModel, setGeminiModel] = useState('gemini-2.0-flash');
+
+  const [inputType, setInputType] = useState<'youtube' | 'pdfUpload' | 'pdfUrl' | 'textInput'>('youtube');
+  const [pdfFile, setPdfFile] = useState<File | null>(null);
+  const [pdfUrl, setPdfUrl] = useState<string>('');
+  const [textInput, setTextInput] = useState<string>('');
+  const [pdfUploadText, setPdfUploadText] = useState<string>('');
+  const [isUploadingPdf, setIsUploadingPdf] = useState<boolean>(false);
 
   useEffect(() => {
     try {
@@ -91,23 +109,104 @@ export default function Home() {
     });
   };
 
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    setPdfFile(null);
+    setPdfUploadText('');
+    setError(null);
+
+    if (file && file.type === 'application/pdf') {
+      setPdfFile(file);
+      setIsUploadingPdf(true);
+      setError(null);
+
+      const formData = new FormData();
+      formData.append('file', file);
+
+      try {
+        const response = await fetch('http://localhost:8000/api/v1/upload_pdf', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json();
+          throw new Error(errorData.detail || `PDFアップロードエラー: ${response.statusText}`);
+        }
+
+        const resultData = await response.json();
+        setPdfUploadText(resultData.extracted_text);
+        console.log(`Successfully extracted text from ${resultData.filename} (${resultData.num_pages} pages)`);
+        setError(null);
+
+      } catch (err: any) {
+        console.error("PDF Upload/Extraction failed:", err);
+        setError(err.message || 'PDFのアップロードまたはテキスト抽出に失敗しました。');
+        setPdfFile(null);
+      } finally {
+        setIsUploadingPdf(false);
+      }
+
+    } else if (file) {
+        setError('無効なファイルタイプです。PDFファイルを選択してください。');
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    if (!url) return;
-    
+
+    let sourceParam = '';
+    let sourceValue = '';
+    let isValid = false;
+
+    if (inputType === 'youtube') {
+      if (!url) { setError('YouTube URLを入力してください。'); return; }
+      sourceParam = 'url';
+      sourceValue = url;
+      isValid = true;
+    } else if (inputType === 'pdfUrl') {
+      if (!pdfUrl) { setError('PDFのURLを入力してください。'); return; }
+      try { new URL(pdfUrl); } catch (_) { setError('有効なPDF URLを入力してください。'); return; }
+      sourceParam = 'pdf_url';
+      sourceValue = pdfUrl;
+      isValid = true;
+    } else if (inputType === 'pdfUpload') {
+      if (!pdfFile) { setError('PDFファイルをアップロードしてください。'); return; }
+      if (isUploadingPdf) { setError('PDFテキスト抽出中です。しばらくお待ちください。'); return; }
+      if (!pdfUploadText) { setError('PDFからのテキスト抽出に失敗しました。別のファイルで試すか、他の入力方法を選択してください。'); return; }
+      sourceParam = 'text_input';
+      sourceValue = pdfUploadText;
+      isValid = true;
+    } else if (inputType === 'textInput') {
+      if (!textInput) { setError('テキストを入力してください。'); return; }
+      sourceParam = 'text_input';
+      sourceValue = textInput;
+      isValid = true;
+    }
+
+    if (!isValid) return;
+
     eventSourceRef.current?.close();
-    
     setLoading(true);
     setError(null);
     setResult(null);
     setProgressMessages([]);
 
-    let apiUrl = `http://localhost:8000/api/v1/convert_stream?url=${encodeURIComponent(url)}&tts=${ttsService}&gemini_model=${encodeURIComponent(geminiModel)}`;
+    const baseUrl = `http://localhost:8000/api/v1/convert_stream`;
+    const queryParams = new URLSearchParams({
+        [sourceParam]: sourceValue,
+        tts: ttsService,
+        gemini_model: geminiModel,
+    });
+
     if (ttsService === 'aivis' && aivisSpeakerId) {
-        apiUrl += `&speaker=${encodeURIComponent(aivisSpeakerId)}`;
+        queryParams.set('speaker', aivisSpeakerId);
     } else if (ttsService === 'openai' && openaiVoice) {
-        apiUrl += `&speaker=${encodeURIComponent(openaiVoice)}`;
+        queryParams.set('speaker', openaiVoice);
     }
+
+    const apiUrl = `${baseUrl}?${queryParams.toString()}`;
+    console.log("Calling API:", apiUrl);
 
     const es = new EventSource(apiUrl, { withCredentials: false });
     eventSourceRef.current = es;
@@ -129,7 +228,9 @@ export default function Home() {
         } else if (parsedEvent.event === 'complete') {
           const data: ConversionResult = parsedEvent.data;
           setResult(data);
-          updateHistory(url);
+          if (inputType === 'youtube') {
+              updateHistory(url);
+          }
           setLoading(false);
           es.close();
           eventSourceRef.current = null;
@@ -159,7 +260,7 @@ export default function Home() {
   };
 
   const handleDownload = () => {
-    if (!result || !result.audio) return;
+    if (!result || !result.audio || !result.tts_usage) return;
 
     try {
       const byteCharacters = atob(result.audio);
@@ -169,18 +270,29 @@ export default function Home() {
       }
       const byteArray = new Uint8Array(byteNumbers);
       
-      const blob = new Blob([byteArray], { type: 'audio/mp3' });
+      let mimeType = 'audio/mpeg';
+      let fileExtension = 'mp3';
+      
+      if (result.tts_usage.model?.toLowerCase().includes('aivis')) {
+          mimeType = 'audio/wav';
+          fileExtension = 'wav';
+      }
+      
+      console.log(`Creating Blob with type: ${mimeType}`);
+      const blob = new Blob([byteArray], { type: mimeType });
       const audioUrl = URL.createObjectURL(blob);
 
       const link = document.createElement('a');
       link.href = audioUrl;
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      link.download = `podcast_${timestamp}.mp3`; 
+      link.download = `podcast_${timestamp}.${fileExtension}`;
       document.body.appendChild(link);
       link.click();
 
       document.body.removeChild(link);
       URL.revokeObjectURL(audioUrl);
+      console.log(`Download initiated as ${link.download}`);
+
     } catch (e) {
       console.error("Failed to initiate audio download:", e);
       setError("音声ファイルのダウンロードに失敗しました。");
@@ -191,49 +303,135 @@ export default function Home() {
     <main className="container mx-auto px-4 py-8">
       <Card className="max-w-2xl mx-auto">
         <CardHeader>
-          <CardTitle className="text-center text-2xl font-bold">YouTube to Podcast Converter</CardTitle>
+          <CardTitle className="text-center text-2xl font-bold">Content to Podcast Converter</CardTitle>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
-            <div className="space-y-1">
-              <label htmlFor="url" className="text-sm font-medium">
-                YouTube Video URL
-              </label>
-              <Input
-                id="url"
-                type="url"
-                list="url-history"
-                placeholder="https://www.youtube.com/watch?v=..."
-                value={url}
-                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setUrl(e.target.value)}
-                required
-                className="text-sm"
-              />
-              <datalist id="url-history">
-                {urlHistory.map((item, index) => (
-                  <option key={index} value={item} />
-                ))}
-              </datalist>
-            </div>
-            
             <div className="space-y-2">
-                <Label className="text-sm font-medium">Geminiモデル選択</Label>
-                <RadioGroup defaultValue="gemini-2.0-flash" value={geminiModel} onValueChange={setGeminiModel} className="flex space-x-4">
-                    <div className="flex items-center space-x-2">
-                        <RadioGroupItem value="gemini-2.0-flash" id="gemini-flash" />
-                        <Label htmlFor="gemini-flash">Gemini 2.0 Flash (高速)</Label>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                        <RadioGroupItem value="gemini-2.5-pro-preview-03-25" id="gemini-pro" />
-                        <Label htmlFor="gemini-pro">Gemini 2.5 Pro (高品質)</Label>
-                    </div>
-                </RadioGroup>
+              <Label className="text-sm font-medium">入力ソースを選択</Label>
+              <RadioGroup defaultValue="youtube" value={inputType} onValueChange={(value) => setInputType(value as any)} className="grid grid-cols-2 gap-2 md:grid-cols-4">
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="youtube" id="type-youtube" />
+                  <Label htmlFor="type-youtube" className="flex items-center gap-1"><Youtube size={16} /> YouTube URL</Label>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="pdfUrl" id="type-pdfurl" />
+                  <Label htmlFor="type-pdfurl" className="flex items-center gap-1"><LinkIcon size={16} /> PDF URL</Label>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="pdfUpload" id="type-pdfupload" />
+                  <Label htmlFor="type-pdfupload" className="flex items-center gap-1"><Upload size={16} /> PDF Upload</Label>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <RadioGroupItem value="textInput" id="type-text" />
+                  <Label htmlFor="type-text" className="flex items-center gap-1"><Text size={16} /> Text Input</Label>
+                </div>
+              </RadioGroup>
             </div>
 
-            <div className="space-y-2">
-                <Label className="text-sm font-medium">TTSサービス選択</Label>
-                <RadioGroup defaultValue="openai" value={ttsService} onValueChange={setTtsService} className="flex space-x-4">
-                    <div className="flex items-center space-x-2">
+            {inputType === 'youtube' && (
+              <div className="space-y-1">
+                <Label htmlFor="youtube-url" className="text-sm font-medium">
+                  YouTube Video URL
+                </Label>
+                <Input
+                  id="youtube-url"
+                  type="url"
+                  list="url-history"
+                  placeholder="https://www.youtube.com/watch?v=..."
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  className="text-sm"
+                />
+                <datalist id="url-history">
+                  {urlHistory.map((item, index) => (
+                    <option key={index} value={item} />
+                  ))}
+                </datalist>
+              </div>
+            )}
+
+            {inputType === 'pdfUrl' && (
+              <div className="space-y-1">
+                <Label htmlFor="pdf-url" className="text-sm font-medium">
+                  PDF URL
+                </Label>
+                <Input
+                  id="pdf-url"
+                  type="url"
+                  placeholder="https://example.com/document.pdf"
+                  value={pdfUrl}
+                  onChange={(e) => setPdfUrl(e.target.value)}
+                  className="text-sm"
+                />
+              </div>
+            )}
+
+            {inputType === 'pdfUpload' && (
+              <div className="space-y-1">
+                <Label htmlFor="pdf-file" className="text-sm font-medium">
+                  PDF ファイルを選択
+                </Label>
+                <div className="flex items-center space-x-2">
+                  <Input
+                    id="pdf-file"
+                    type="file"
+                    accept="application/pdf"
+                    onChange={handleFileChange}
+                    disabled={isUploadingPdf}
+                    className="text-sm file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-primary file:text-primary-foreground hover:file:bg-primary/90 flex-grow"
+                  />
+                  {isUploadingPdf && <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />} 
+                </div>
+                 {pdfFile && !isUploadingPdf && pdfUploadText && (
+                    <p className="text-xs text-green-600 flex items-center gap-1">
+                        <FileText size={12} /> {pdfFile.name} のテキスト抽出完了！
+                    </p>
+                 )} 
+                 {pdfFile && !isUploadingPdf && !pdfUploadText && error && (
+                     <p className="text-xs text-red-600">
+                          テキスト抽出失敗。
+                      </p>
+                 )} 
+              </div>
+            )}
+
+            {inputType === 'textInput' && (
+              <div className="space-y-1">
+                <Label htmlFor="text-input" className="text-sm font-medium">
+                  テキスト入力
+                </Label>
+                <Textarea
+                  id="text-input"
+                  placeholder="ここにテキストを入力..."
+                  value={textInput}
+                  onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => setTextInput(e.target.value)}
+                  className="text-sm min-h-[100px]"
+                />
+              </div>
+            )}
+
+            <Separator />
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-2">
+                  <Label className="text-sm font-medium">Geminiモデル選択</Label>
+                  <RadioGroup defaultValue="gemini-2.0-flash" value={geminiModel} onValueChange={setGeminiModel} className="flex space-x-4">
+                      <div className="flex items-center space-x-2">
+                          <RadioGroupItem value="gemini-2.0-flash" id="gemini-flash" />
+                          <Label htmlFor="gemini-flash">Gemini 2.0 Flash (高速)</Label>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                          <RadioGroupItem value="gemini-2.5-pro-preview-03-25" id="gemini-pro" />
+                          <Label htmlFor="gemini-pro">Gemini 2.5 Pro (高品質)</Label>
+                      </div>
+                  </RadioGroup>
+              </div>
+
+              <div className="space-y-2">
+                  <Label className="text-sm font-medium">TTSサービス選択</Label>
+                  <RadioGroup defaultValue="openai" value={ttsService} onValueChange={setTtsService} className="flex space-x-4">
+                     <div className="flex items-center space-x-2">
                         <RadioGroupItem value="openai" id="openai" />
                         <Label htmlFor="openai">OpenAI TTS (クラウド)</Label>
                     </div>
@@ -241,48 +439,57 @@ export default function Home() {
                         <RadioGroupItem value="aivis" id="aivis" />
                         <Label htmlFor="aivis">Aivis Speech (ローカル)</Label>
                     </div>
-                </RadioGroup>
+                  </RadioGroup>
+              </div>
             </div>
 
-            {ttsService === 'openai' && (
-                 <div className="space-y-2">
-                    <Label className="text-sm font-medium">OpenAI 話者選択</Label>
-                    <RadioGroup 
-                        defaultValue="alloy" 
-                        value={openaiVoice} 
-                        onValueChange={setOpenaiVoice} 
-                        className="grid grid-cols-3 gap-2 md:grid-cols-6"
-                    >
-                        {openaiVoices.map((voice) => (
-                            <div key={voice} className="flex items-center space-x-2">
-                                <RadioGroupItem value={voice} id={`openai-${voice}`} />
-                                <Label htmlFor={`openai-${voice}`} className="capitalize">{voice}</Label>
-                            </div>
-                        ))}
-                    </RadioGroup>
-                 </div>
-            )}
+            {(ttsService === 'openai' || ttsService === 'aivis') && <Separator />}
 
-            {ttsService === 'aivis' && (
-                <div className="space-y-1">
-                    <Label htmlFor="aivis-speaker" className="text-sm font-medium">
-                        Aivis 話者ID (例: 488039072 = コロ助)
-                    </Label>
-                    <Input
-                        id="aivis-speaker"
-                        type="number"
-                        placeholder="話者IDを入力 (例: 488039072)"
-                        value={aivisSpeakerId}
-                        onChange={(e) => setAivisSpeakerId(e.target.value)}
-                        className="text-sm"
-                    />
-                    <p className="text-xs text-muted-foreground">
-                        利用可能なIDは <a href="https://github.com/your-repo/youtube2podcast/blob/main/backend/aivis.md#利用可能な話者id-speaker-ids" target="_blank" rel="noopener noreferrer" className="underline">aivis.md</a> を参照してください。
-                    </p>
-                </div>
-            )}
-            
-            <Button type="submit" className="w-full" disabled={loading || !url}>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {ttsService === 'openai' && (
+                    <div className="space-y-2">
+                        <Label className="text-sm font-medium">OpenAI 話者選択</Label>
+                        <RadioGroup defaultValue="alloy" value={openaiVoice} onValueChange={setOpenaiVoice} className="grid grid-cols-3 gap-2 md:grid-cols-6">
+                            {openaiVoices.map((voice) => (
+                                <div key={voice} className="flex items-center space-x-2">
+                                    <RadioGroupItem value={voice} id={`openai-${voice}`} />
+                                    <Label htmlFor={`openai-${voice}`} className="capitalize">{voice}</Label>
+                                </div>
+                            ))}
+                        </RadioGroup>
+                    </div>
+                )}
+
+                {ttsService === 'aivis' && (
+                    <div className="space-y-1">
+                        <Label htmlFor="aivis-speaker-select" className="text-sm font-medium">Aivis 話者選択</Label>
+                        <Select value={aivisSpeakerId} onValueChange={setAivisSpeakerId}>
+                          <SelectTrigger id="aivis-speaker-select" className="text-sm">
+                            <SelectValue placeholder="話者を選択..." />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {aivisSpeakers.map((speaker) => (
+                              <SelectItem key={speaker.id} value={speaker.id} className="text-sm">
+                                {speaker.name} ({speaker.id})
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                    </div>
+                )}
+            </div>
+
+            <Separator />
+            <Button 
+              type="submit" 
+              className="w-full" 
+              disabled={loading || isUploadingPdf || 
+                  (inputType === 'pdfUpload' && !pdfUploadText) ||
+                  (inputType === 'youtube' && !url) ||
+                  (inputType === 'pdfUrl' && !pdfUrl) ||
+                  (inputType === 'textInput' && !textInput)
+              }
+            >
               {loading ? '変換中...' : 'Podcastに変換'}
             </Button>
           </form>
@@ -292,86 +499,67 @@ export default function Home() {
               <div className="flex justify-center items-center p-4">
                 <Loader2 className="h-8 w-8 animate-spin text-primary" />
               </div>
-              <Card className="p-4 bg-muted/40">
-                <ul className="space-y-2">
-                  {progressMessages.map((msg) => (
-                    <li key={msg.id} className="flex items-center text-sm">
-                      <span className="mr-2 text-lg">{msg.icon}</span>
-                      <span>{msg.message}</span>
-                    </li>
-                  ))}
-                </ul>
-              </Card>
+              <div className="space-y-1 text-sm text-center text-muted-foreground">
+                {progressMessages.map((msg) => (
+                    <p key={msg.id}>{msg.icon} {msg.message}</p>
+                ))}
+              </div>
             </div>
           )}
 
-          {error && !loading && (
+          {error && (
             <Alert variant="destructive" className="mt-4">
               <AlertCircle className="h-4 w-4" />
-              <AlertTitle>エラー</AlertTitle>
-              <AlertDescription>
-                {error} 
-              </AlertDescription>
+              <AlertTitle>Error</AlertTitle>
+              <AlertDescription>{error}</AlertDescription>
             </Alert>
           )}
 
           {result && (
-            <div className="mt-6 space-y-6">
-              <div className="space-y-2">
-                <h3 className="text-lg font-semibold">Podcast原稿 (日本語)</h3>
-                <div className="p-4 bg-gray-100 dark:bg-gray-800 rounded-md text-sm whitespace-pre-wrap h-60 overflow-y-auto">
-                  {result.text}
+            <Card className="mt-6">
+              <CardHeader>
+                <CardTitle>変換結果</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div>
+                    <Label className="text-sm font-medium">生成された音声</Label>
+                    <AudioPlayer audioData={result.audio} />
                 </div>
-              </div>
-
-              <div className="space-y-2">
-                <div className="flex justify-between items-center">
-                  <h3 className="text-lg font-semibold">生成された音声</h3>
-                  <Button onClick={handleDownload} variant="outline" size="sm">
-                    <Download className="mr-2 h-4 w-4" />
-                    ダウンロード
-                  </Button>
+                <Separator />
+                <div>
+                    <Label className="text-sm font-medium">最適化されたテキスト</Label>
+                    <Textarea value={result.text} readOnly className="mt-1 w-full h-32 text-xs bg-muted" />
                 </div>
-                <AudioPlayer audioData={result.audio} />
-              </div>
-
-              <Separator />
-
-              <div className="space-y-4 text-sm text-gray-600 dark:text-gray-400">
-                <h4 className="text-md font-semibold text-gray-800 dark:text-gray-200">利用状況 (概算)</h4>
-                {result.gemini_usage && (
-                  <div className="flex items-center justify-between p-2 bg-gray-50 dark:bg-gray-800 rounded">
-                    <div className="flex items-center space-x-2">
-                      <BrainCircuit className="h-5 w-5 text-blue-500" />
-                      <span>Gemini ({result.gemini_usage.model.includes('1.5-pro') ? '1.5 Pro' : result.gemini_usage.model}):</span> 
-                    </div>
-                    <div className="text-right">
-                      <div>Tokens: {result.gemini_usage.input_tokens} (入力) + {result.gemini_usage.output_tokens} (出力)</div>
-                      <div>費用: {formatCost(result.gemini_usage.cost_usd)}</div>
-                    </div>
-                  </div>
-                )}
-                {result.tts_usage && (
-                  <div className="flex items-center justify-between p-2 bg-gray-50 dark:bg-gray-800 rounded">
-                    <div className="flex items-center space-x-2">
-                      <Coins className="h-5 w-5 text-green-500" />
-                      <span>TTS ({result.tts_usage.model}):</span> 
-                    </div>
-                    <div className="text-right">
-                      <div>文字数: {result.tts_usage.characters.toLocaleString()}</div>
-                      <div>費用: {formatCost(result.tts_usage.cost_usd)}</div>
-                    </div>
-                  </div>
-                )}
-                {(result.gemini_usage || result.tts_usage) && (
-                  <div className="flex items-center justify-between p-2 font-semibold border-t border-gray-200 dark:border-gray-700 pt-2 mt-2">
-                    <span>合計費用 (USD):</span>
-                    <span>{formatCost((result.gemini_usage?.cost_usd ?? 0) + (result.tts_usage?.cost_usd ?? 0))}</span>
-                  </div>
-                )}
-                <p className="text-xs text-center text-gray-500">※表示されている費用は概算であり、実際の請求額とは異なる場合があります。</p>
-              </div>
-            </div>
+                <Separator />
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                    {result.gemini_usage && (
+                         <div className="space-y-1 p-3 bg-muted rounded-md">
+                            <p className="font-medium flex items-center gap-1"><BrainCircuit size={14}/> Gemini Usage ({result.gemini_usage.model})</p>
+                            <p>Input Tokens: {result.gemini_usage.input_tokens}</p>
+                            <p>Output Tokens: {result.gemini_usage.output_tokens}</p>
+                            <p>Estimated Cost: {formatCost(result.gemini_usage.cost_usd)}</p>
+                        </div>
+                    )}
+                    {result.tts_usage && (
+                        <div className="space-y-1 p-3 bg-muted rounded-md">
+                            <p className="font-medium flex items-center gap-1"><Coins size={14}/> TTS Usage ({result.tts_usage.model})</p>
+                            <p>Characters Processed: {result.tts_usage.processed_characters} / {result.tts_usage.characters}</p>
+                            <p>Estimated Cost: {formatCost(result.tts_usage.cost_usd)}</p>
+                        </div>
+                    )}
+                </div>
+                 {result.gemini_usage && result.tts_usage && (
+                     <div className="text-right font-semibold text-sm">
+                         Total Estimated Cost: {formatCost((result.gemini_usage?.cost_usd ?? 0) + (result.tts_usage?.cost_usd ?? 0))}
+                     </div>
+                 )}
+              </CardContent>
+              <CardFooter className="flex justify-end">
+                <Button onClick={handleDownload} variant="outline">
+                    <Download className="mr-2 h-4 w-4" /> Download MP3
+                </Button>
+              </CardFooter>
+            </Card>
           )}
         </CardContent>
       </Card>
